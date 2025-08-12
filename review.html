@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>口コミ案の作成</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; margin:0; background:#f8fafc; }
+    .wrap { max-width: 720px; margin: 24px auto; padding: 16px; }
+    .card { background:#fff; border:1px solid #e5e7eb; border-radius: 14px; padding:16px; box-shadow: 0 4px 12px rgba(0,0,0,0.04); }
+    .title { font-weight:700; font-size:18px; margin:0 0 8px; }
+    .subtle { color:#64748b; font-size:13px; margin-bottom:10px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    textarea { width:100%; height:160px; border-radius:10px; padding:10px; border:1px solid #cbd5e1; font-size:14px; }
+    button { padding:10px 14px; border-radius:10px; border:1px solid #cbd5e1; background:#0ea5e9; color:#fff; cursor:pointer; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .muted { font-size:12px; color:#475569; }
+    .spinner { width:22px; height:22px; border:3px solid #e2e8f0; border-top-color:#0ea5e9; border-radius:50%; animation: spin 0.9s linear infinite; margin-right:6px; }
+    @keyframes spin{ to{ transform:rotate(360deg);} }
+    .err { color:#b91c1c; }
+
+    /* === Modal === */
+    .overlay{ position:fixed; inset:0; background:rgba(15,23,42,.45); display:none; align-items:center; justify-content:center; padding:16px; z-index:50; }
+    .modal{ width:100%; max-width:720px; background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:16px; box-shadow:0 20px 60px rgba(0,0,0,.25); }
+    .modal h2{ margin:0 0 8px; font-size:18px; }
+    .modal p{ margin:0 0 10px; color:#475569; font-size:13px; }
+    .modal .actions{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+    .btn-secondary{ background:#64748b; color:#fff; }
+    .btn-success{ background:#22c55e; color:#fff; }
+    .close-x{ position:absolute; right:14px; top:10px; font-size:20px; color:#475569; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1 class="title">ご回答ありがとうございました</h1>
+      <div id="status" class="subtle">患者様の回答をもとに文章を生成しています…</div>
+      <div class="row" id="loading">
+        <div class="spinner"></div><div>送信中…（20秒以内に完了する想定です）</div>
+      </div>
+
+      <div id="result" style="display:none;">
+        <textarea id="aiText"></textarea>
+        <div class="row" style="margin-top:8px;">
+          <button id="copyBtn">コピー</button>
+          <button id="retryBtn" class="btn-secondary">再生成</button>
+          <button id="openModalBtn" class="btn-success">その場で投稿する（推奨）</button>
+          <span id="msg" class="muted"></span>
+        </div>
+        <div class="muted">※「その場で投稿する」を押すと、投稿用の画面がこのページ上に開きます。</div>
+      </div>
+
+      <div id="error" class="err subtle" style="display:none;"></div>
+
+      <div style="margin-top:12px;">
+        <a href="survey_page.html" class="muted">← アンケート画面に戻る</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- === 投稿用モーダル === -->
+  <div id="postOverlay" class="overlay" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="postTitle">
+      <div class="close-x" id="closeX" aria-label="閉じる">×</div>
+      <h2 id="postTitle">Googleマップに口コミを投稿</h2>
+      <p>以下の内容が自動的にコピーされます。必要なら編集してから「コピーして投稿画面へ」を押してください。</p>
+      <textarea id="postText" style="height:180px;"></textarea>
+      <div class="actions">
+        <button id="copyAndPost" class="btn-success">コピーして投稿画面へ</button>
+        <button id="closeModal" class="btn-secondary">閉じる</button>
+        <span id="postMsg" class="muted"></span>
+      </div>
+      <p class="muted" style="margin-top:8px;">※Googleの投稿画面は別タブで開きます。貼り付けて送信をお願いします。</p>
+    </div>
+  </div>
+
+  <script>
+    // ====== 必ず差し替え ======
+    const API_BASE   = "https://clinic-review-api.onrender.com";
+    const CLINIC_TOKEN = "4b4c2ddeb7ed61cb736e51c0d5829158";
+    const PLACE_ID   = "ChIJ62q-cXv1GGARlnobomFvthk"; // 任意。未設定でも動作します
+    const GM_REVIEW_URL = `https://search.google.com/local/writereview?placeid=${PLACE_ID}`;
+
+    // ====== ユーティリティ ======
+    const $ = (s) => document.querySelector(s);
+    const withTimeout = (p, ms=10000) =>
+      Promise.race([ p, new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")), ms)) ]);
+
+    function getAnswersFromStorage() {
+      try { const raw = sessionStorage.getItem("clinic_answers"); return raw ? JSON.parse(raw) : null; }
+      catch { return null; }
+    }
+
+    async function callApi(answers) {
+      const res = await fetch(`${API_BASE}/api/generate-review`, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json", "X-Clinic-Token": CLINIC_TOKEN },
+        body: JSON.stringify({ answers })
+      });
+      if (!res.ok) throw new Error("API error " + res.status);
+      const data = await res.json();
+      return (data.review||"").trim();
+    }
+
+    async function generate() {
+      const answers = getAnswersFromStorage();
+      if (!answers) {
+        $("#error").textContent = "回答データが見つかりません。アンケート画面からやり直してください。";
+        $("#error").style.display = "block"; $("#loading").style.display = "none"; return;
+      }
+      $("#result").style.display = "none";
+      $("#error").style.display = "none";
+      $("#loading").style.display = "flex";
+      $("#status").textContent = "患者様の回答をもとに文章を生成しています…";
+
+      try {
+        const review = await withTimeout(callApi(answers), 30000);
+        $("#aiText").value = review;
+        $("#result").style.display = "block";
+        $("#loading").style.display = "none";
+        $("#status").textContent = "もしよろしければ、アンケート結果をもとにAIが生成した口コミを確認いただきGoogleマップのクリニックページへの投稿のご協力を頂けますと幸いです。スタッフのやる気に繋がります！";
+      } catch (e) {
+        $("#loading").style.display = "none";
+        $("#error").style.display = "block";
+        $("#error").textContent = e.message === "timeout"
+          ? "タイムアウトしました。通信状況をご確認のうえ、再生成をお試しください。"
+          : "生成に失敗しました。時間をおいて再度お試しください。";
+        $("#status").textContent = "エラーが発生しました。";
+      }
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      // クリップボードコピー
+      $("#copyBtn").addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText($("#aiText").value);
+          $("#msg").textContent = "コピーしました"; setTimeout(()=> $("#msg").textContent = "", 2000);
+        } catch { $("#msg").textContent = "コピーに失敗しました"; }
+      });
+
+      // 再生成
+      $("#retryBtn").addEventListener("click", generate);
+
+      // モーダル開閉
+      const overlay = $("#postOverlay");
+      const openModal = () => { $("#postText").value = $("#aiText").value; overlay.style.display = "flex"; overlay.setAttribute("aria-hidden","false"); };
+      const closeModal = () => { overlay.style.display = "none"; overlay.setAttribute("aria-hidden","true"); $("#postMsg").textContent = ""; };
+      $("#openModalBtn").addEventListener("click", openModal);
+      $("#closeModal").addEventListener("click", closeModal);
+      $("#closeX").addEventListener("click", closeModal);
+      overlay.addEventListener("click", (e)=>{ if(e.target===overlay) closeModal(); });
+      document.addEventListener("keydown", (e)=>{ if(e.key==="Escape") closeModal(); });
+
+      // コピーして投稿画面を開く
+      $("#copyAndPost").addEventListener("click", async () => {
+        const text = $("#postText").value;
+        try {
+          await navigator.clipboard.writeText(text);
+          $("#postMsg").textContent = "コピーしました。投稿画面を開きます…";
+          window.open(GM_REVIEW_URL, "_blank");
+          setTimeout(()=> $("#postMsg").textContent = "", 2000);
+        } catch {
+          alert("コピーに失敗しました。投稿画面は開きますが、手動で口コミ文をコピーしてください。");
+          window.open(GM_REVIEW_URL, "_blank");
+        }
+      });
+
+      // 初回生成
+      generate();
+    });
+  </script>
+</body>
+</html>
